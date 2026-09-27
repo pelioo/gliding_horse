@@ -107,10 +107,17 @@ impl AuditReport {
                     AuditStatus::Fail(message) => message.clone(),
                     _ => "audit failed".to_string(),
                 };
+                let mut evidence = result.evidence.clone();
+                if !result.details.is_empty() {
+                    if !evidence.is_empty() {
+                        evidence.push('\n');
+                    }
+                    evidence.push_str(&result.details.join("\n"));
+                }
                 AuditFinding {
                     dimension: result.dimension.clone(),
                     message,
-                    evidence: result.evidence.clone(),
+                    evidence,
                     scope: scope_for_dimension(&result.dimension),
                     identity_keys: Vec::new(),
                 }
@@ -134,10 +141,23 @@ impl AuditReport {
         } else {
             AuditVerdict::Pass
         };
+        // The BizAgent aggregator emits a stable, programmatic marker when a
+        // child returned status=success but failed its typed evidence contract
+        // (see biz_agent.rs parent-aggregation error). Detect it here so the
+        // repair layer routes to RetryCa/Blocked instead of RetryDa, which
+        // would replay the same unachievable Do plan and exhaust the PDCA
+        // budget without converging.
+        const TYPED_EVIDENCE_MARKER: &str =
+            "typed evidence requirements were not all satisfied in the final workspace epoch";
         let reason = if failures.is_empty() {
             None
         } else if scope == RepairScope::Task {
             Some(RecoveryReason::PlanInvalid)
+        } else if findings
+            .iter()
+            .any(|finding| finding.evidence.contains(TYPED_EVIDENCE_MARKER))
+        {
+            Some(RecoveryReason::EvidenceMissing)
         } else {
             Some(RecoveryReason::LocalExecutionGap)
         };

@@ -962,7 +962,7 @@ impl Default for AgentExecutionBudgetSettings {
 }
 
 fn default_max_pdca_cycles() -> u32 {
-    7
+    4
 }
 fn default_max_active() -> usize {
     20
