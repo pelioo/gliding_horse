@@ -1803,6 +1803,289 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn role_contract_retry_directive_enumerates_missing_roles() {
+        // Snapshot two LLM requests: the initial prompt and the retry prompt.
+        // The retry directive MUST list the missing roles in natural language
+        // and include a JSON scaffold template. This is the regression for the
+        // "SA plan could not obtain a valid execution plan" bug.
+        //
+        // Task wording is deliberately Standard-classified (length > 50,
+        // contains "first...then" for explicit ordering, no recursive /
+        // exploratory / emergency keywords) so that the kernel demands a
+        // full PA→DA→CA→AA plan. The downgraded plan satisfies the
+        // order_contract check (Do work package has a dependency edge) so
+        // the validator reaches the role_contract gate.
+        let user_task = "First collect the user requirements, then draft the documentation, then review it, then publish the final version.";
+        let downgraded_plan = r#"{"complexity":"simple","description":"x","steps":[{"step_id":"only_do","role":"Do","objective":"publish the documentation","expected_output":"documentation","dependencies":[],"success_criteria":"published","work_packages":[{"id":"draft","objective":"draft docs","expected_output":"draft.md","success_criteria":"drafted","evidence_requirements":[{"type":"artifact_delivery","paths":["draft.md"],"min_paths":1}],"dependencies":[]},{"id":"publish","objective":"ship docs","expected_output":"docs.md","success_criteria":"shipped","evidence_requirements":[{"type":"artifact_delivery","paths":["docs.md"],"min_paths":1}],"dependencies":["draft"]}]}],"success_metrics":["ok"]}"#;
+        let (base_url, server, requests) = sa_capturing_response_server(vec![
+            (
+                200,
+                "text/event-stream",
+                completed_stream_response("provider-role-retry-initial", downgraded_plan),
+            ),
+            (
+                200,
+                "text/event-stream",
+                completed_stream_response("provider-role-retry-corrected", downgraded_plan),
+            ),
+        ])
+        .await;
+        let (sa, _dir) = make_sa_with_tempdir_at(&base_url);
+        let _ = sa
+            .analyze_task_with_llm(
+                "iri://task/role-retry-directive-snapshot",
+                user_task,
+                &crate::core::five_w2h::Task5W2H::default(),
+                &[],
+                &HashMap::new(),
+            )
+            .await;
+        server.await.unwrap();
+
+        let bodies = requests.lock().unwrap();
+        assert_eq!(
+            bodies.len(),
+            2,
+            "initial + retry body must be captured"
+        );
+        let retry_body: serde_json::Value =
+            serde_json::from_str(&bodies[1]).expect("retry body must be JSON");
+        let retry_messages = retry_body
+            .get("messages")
+            .and_then(|m| m.as_array())
+            .expect("messages array");
+        let directive_message = retry_messages
+            .iter()
+            .find(|message| {
+                message.get("name").and_then(|n| n.as_str())
+                    == Some("context_authoritative_instruction")
+            })
+            .expect("retry must include a context_authoritative_instruction system message");
+        let directive_text = directive_message
+            .get("content")
+            .and_then(|c| c.as_str())
+            .expect("retry directive content is a string");
+        assert!(
+            directive_text.contains("MISSING required role definitions"),
+            "stage-specific retry directive must surface the missing-role failure mode, got: {directive_text}"
+        );
+        assert!(
+            directive_text.contains("Plan")
+                && directive_text.contains("Do")
+                && directive_text.contains("Check")
+                && directive_text.contains("Act"),
+            "retry directive must enumerate every required role by name, got: {directive_text}"
+        );
+        assert!(
+            directive_text.contains("ADD"),
+            "retry directive must use the verb ADD, not generic correct, got: {directive_text}"
+        );
+        assert!(
+            directive_text.contains("\"step_id\""),
+            "retry directive must include a JSON scaffold template, got: {directive_text}"
+        );
+        assert!(
+            directive_text.contains("MUST NOT downgrade the complexity"),
+            "retry directive must forbid the downgrade that caused this failure, got: {directive_text}"
+        );
+
+        let initial_body: serde_json::Value =
+            serde_json::from_str(&bodies[0]).expect("initial body must be JSON");
+        let initial_messages = initial_body
+            .get("messages")
+            .and_then(|m| m.as_array())
+            .expect("messages array");
+        let initial_system = initial_messages
+            .iter()
+            .find(|message| {
+                message.get("name").and_then(|n| n.as_str()) == Some("sa_plan_contract")
+            })
+            .expect("initial prompt must include sa_plan_contract system message");
+        let initial_text = initial_system
+            .get("content")
+            .and_then(|c| c.as_str())
+            .expect("initial content is a string");
+        assert!(
+            initial_text.contains("Mandatory Role Coverage Rule"),
+            "initial prompt must include the Mandatory Role Coverage Rule, got: {initial_text}"
+        );
+        for required_role in ["Plan", "Do", "Check", "Act"] {
+            assert!(
+                initial_text.contains(&format!("\"{required_role}\"")),
+                "initial prompt must require role {required_role} explicitly, got: {initial_text}"
+            );
+        }
+        assert!(
+            initial_text.contains("MUST NOT downgrade"),
+            "initial prompt must forbid downgrading complexity below the kernel floor, got: {initial_text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scaffold_fallback_recovers_when_llm_persistently_downgrades() {
+        // The LLM emits a Simple downgrade plan for both the initial call
+        // and the bounded retry. The Tier 3 structured scaffold asks the LLM
+        // to fill in business content for a kernel-authored 4-step skeleton;
+        // when the mock returns a properly-filled scaffold the kernel must
+        // accept it and dispatch.
+        //
+        // Task wording is deliberately Standard-classified (length > 50,
+        // contains "first...then", no recursive / exploratory / emergency
+        // keywords) so the kernel demands the full PA→DA→CA→AA set.
+        // The downgraded plan satisfies order_contract (Do has a dependency
+        // edge) so the validator reaches role_contract and Tier 3 fires.
+        // The scaffold response also satisfies order_contract (Do has a
+        // dependency edge) so the kernel accepts it.
+        let user_task = "First collect the user requirements, then draft the documentation, then review it, then publish the final version.";
+        let downgraded_plan = r#"{"complexity":"simple","description":"bad downgrade","steps":[{"step_id":"only_do","role":"Do","objective":"publish","expected_output":"documentation","dependencies":[],"success_criteria":"published","work_packages":[{"id":"draft","objective":"draft","expected_output":"draft.md","success_criteria":"drafted","evidence_requirements":[{"type":"artifact_delivery","paths":["draft.md"],"min_paths":1}],"dependencies":[]},{"id":"publish","objective":"ship","expected_output":"docs.md","success_criteria":"shipped","evidence_requirements":[{"type":"artifact_delivery","paths":["docs.md"],"min_paths":1}],"dependencies":["draft"]}]}],"success_metrics":["ok"]}"#;
+        let filled_scaffold = r#"{
+          "complexity":"standard",
+          "description":"requirements scaffold filled in",
+          "steps":[
+            {"step_id":"scaffold_plan_0","role":"Plan","objective":"collect requirements","expected_output":"requirements","dependencies":[],"work_packages":[],"tools_allowed":["file_read"],"success_criteria":"collected"},
+            {"step_id":"scaffold_do_1","role":"Do","objective":"draft documentation","expected_output":"documentation","dependencies":["scaffold_plan_0"],"work_packages":[{"id":"draft","objective":"draft","expected_output":"draft.md","success_criteria":"drafted","evidence_requirements":[{"type":"artifact_delivery","paths":["draft.md"],"min_paths":1}],"dependencies":[]},{"id":"publish","objective":"ship","expected_output":"docs.md","success_criteria":"shipped","evidence_requirements":[{"type":"artifact_delivery","paths":["docs.md"],"min_paths":1}],"dependencies":["draft"]}],"tools_allowed":["file_read","file_write","bash"],"success_criteria":"drafted"},
+            {"step_id":"scaffold_check_2","role":"Check","objective":"review documentation","expected_output":"review","dependencies":["scaffold_do_1"],"work_packages":[],"tools_allowed":["file_read"],"success_criteria":"reviewed"},
+            {"step_id":"scaffold_act_3","role":"Act","objective":"publish final","expected_output":"decision","dependencies":["scaffold_check_2"],"work_packages":[],"tools_allowed":["file_read"],"success_criteria":"published"}
+          ],
+          "success_metrics":["ok"]
+        }"#;
+        let (base_url, server, requests) = sa_capturing_response_server(vec![
+            (
+                200,
+                "text/event-stream",
+                completed_stream_response(
+                    "provider-scaffold-initial",
+                    downgraded_plan,
+                ),
+            ),
+            (
+                200,
+                "text/event-stream",
+                completed_stream_response(
+                    "provider-scaffold-retry",
+                    downgraded_plan,
+                ),
+            ),
+            (
+                200,
+                "text/event-stream",
+                completed_stream_response(
+                    "provider-scaffold-tier3",
+                    filled_scaffold,
+                ),
+            ),
+        ])
+        .await;
+        let (sa, _dir) = make_sa_with_tempdir_at(&base_url);
+        let plan = sa
+            .analyze_task_with_llm(
+                "iri://task/scaffold-fallback-success",
+                user_task,
+                &crate::core::five_w2h::Task5W2H::default(),
+                &[],
+                &HashMap::new(),
+            )
+            .await
+            .expect("Tier 3 scaffold must rescue the persistent downgrade");
+        server.await.unwrap();
+
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            3,
+            "initial + retry + scaffold must all be exercised"
+        );
+        let roles: Vec<_> = plan.steps.iter().map(|step| step.role).collect();
+        assert_eq!(
+            roles,
+            vec![
+                crate::core::agent_instance::AgentRole::Plan,
+                crate::core::agent_instance::AgentRole::Do,
+                crate::core::agent_instance::AgentRole::Check,
+                crate::core::agent_instance::AgentRole::Act,
+            ],
+            "scaffold fallback must yield the full PDCA step set, got {roles:?}"
+        );
+        let provenance = plan
+            .try_agent_spec_provenance()
+            .expect("scaffold provenance is valid")
+            .expect("scaffold sets provenance");
+        assert_eq!(
+            provenance.plan_source.producer.as_deref(),
+            Some("SupervisorAgent.plan_generation_scaffold"),
+            "scaffold provenance must distinguish the recovery path"
+        );
+        assert!(
+            plan.steps
+                .iter()
+                .all(|step| !step.step_id.starts_with("step_kernel_")),
+            "scaffold must use its own step ids, not the reserved kernel namespace"
+        );
+    }
+
+    #[tokio::test]
+    async fn scaffold_fallback_falls_back_when_tier3_also_fails() {
+        // If the LLM continues to downgrade even on the scaffold prompt, the
+        // kernel must surface the original role_contract rejection (not hang,
+        // not loop forever). The mock returns three identical downgraded
+        // plans that satisfy order_contract but fail role_contract.
+        let user_task = "First collect the user requirements, then draft the documentation, then review it, then publish the final version.";
+        let downgraded_plan = r#"{"complexity":"simple","description":"still bad","steps":[{"step_id":"only_do","role":"Do","objective":"publish","expected_output":"documentation","dependencies":[],"success_criteria":"published","work_packages":[{"id":"draft","objective":"draft","expected_output":"draft.md","success_criteria":"drafted","evidence_requirements":[{"type":"artifact_delivery","paths":["draft.md"],"min_paths":1}],"dependencies":[]},{"id":"publish","objective":"ship","expected_output":"docs.md","success_criteria":"shipped","evidence_requirements":[{"type":"artifact_delivery","paths":["docs.md"],"min_paths":1}],"dependencies":["draft"]}]}],"success_metrics":["ok"]}"#;
+        let (base_url, server, _requests) = sa_capturing_response_server(vec![
+            (
+                200,
+                "text/event-stream",
+                completed_stream_response(
+                    "provider-scaffold-fallback-initial",
+                    downgraded_plan,
+                ),
+            ),
+            (
+                200,
+                "text/event-stream",
+                completed_stream_response(
+                    "provider-scaffold-fallback-retry",
+                    downgraded_plan,
+                ),
+            ),
+            (
+                200,
+                "text/event-stream",
+                completed_stream_response(
+                    "provider-scaffold-fallback-tier3",
+                    downgraded_plan,
+                ),
+            ),
+        ])
+        .await;
+        let (sa, _dir) = make_sa_with_tempdir_at(&base_url);
+        let error = sa
+            .analyze_task_with_llm(
+                "iri://task/scaffold-fallback-exhausted",
+                user_task,
+                &crate::core::five_w2h::Task5W2H::default(),
+                &[],
+                &HashMap::new(),
+            )
+            .await
+            .expect_err("persistent downgrade must be hard-blocked");
+        server.await.unwrap();
+
+        let diagnostic = error.to_string();
+        assert!(
+            diagnostic.contains("sa_plan_contract_rejected"),
+            "outer error must wrap as sa_plan_contract_rejected, got: {diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("effective Standard plan is missing required LLM-authored role definitions"),
+            "outer error must still surface the role-missing diagnosis, got: {diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("single bounded causal correction"),
+            "outer error must still mention the bounded retry budget, got: {diagnostic}"
+        );
+    }
+
+    #[tokio::test]
     async fn chinese_calculator_keyword_standard_rejects_model_simple_downgrade() {
         let exact_task = "使用python语言开发计算器程序，需要先进行设计，使用markdown语言，涉及图形使用mermaid格式输出，然后进行测试和文档编写，完成整个工程。注意：必须新创建一个目录把项目相关内容都创建到该目录下。";
         let downgraded_plan = r#"{
